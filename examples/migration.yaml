@@ -1,0 +1,20 @@
+# Proposed config for the October sample. Not executable yet.
+migration:
+  id: ecommerce-events-october-demo
+
+source:
+  schema: demo
+  table: fact_events_source
+  timestamp_column: event_time
+
+target:
+  schema: demo
+  table: fact_events_rebuilt
+
+boundaries:
+  valid_from: "2019-10-01 00:00:00"
+  valid_before: "2019-11-01 00:00:00"
+  timezone: UTC
+
+chunking:
+  days_per_chunk: 7

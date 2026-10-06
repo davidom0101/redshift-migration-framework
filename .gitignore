@@ -1,0 +1,29 @@
+# Terraform local working files and state can contain account metadata or secrets.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+crash.log
+
+# Optional project-local tooling.
+.tools/
+
+# Local Python environments and generated data.
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.pyc
+*.egg-info/
+dist/
+.env
+.env.*
+!.env.example
+SETUP_STATUS.md
+results/private/
+
+# Local project notes; add the public README when the project is complete.
+/README.md
