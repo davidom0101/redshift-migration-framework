@@ -17,5 +17,20 @@ Data files are not included.
    then run chunks.sql once to seed the five October chunks.
    Skip it when resuming; rerunning inserts duplicates.
 
-migration.yaml outlines seven day chunks. The migration runner
-is not implemented yet, and the YAML is not executable.
+## Run one chunk
+
+Git Bash, from the project root, using your existing AWS credentials:
+
+```bash
+uv sync
+export AWS_DEFAULT_REGION="eu-west-1"
+export REDSHIFT_WORKGROUP="migration-dev"
+export REDSHIFT_DATABASE="migration_lab"
+export REDSHIFT_SECRET_ARN='<database credentials secret ARN>'
+uv run python -m migration.runner
+```
+
+Runs chunk 1 and checks row counts after committing. Reruns recheck DONE chunks
+without copying them again.
+
+Keep the source unchanged and run one migration at a time. After a failure, check the previous query’s outcome before rerunning.

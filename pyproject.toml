@@ -1,9 +1,11 @@
 [project]
 name = "redshift-deep-copy-migration"
 version = "0.1.0"
-description = "Resumable Redshift deep-copy migration framework (implementation planned)."
+description = "Chunked Redshift deep-copy migration using the Data API."
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = [
+    "boto3>=1.40,<2",
+]
 
 [dependency-groups]
 dev = [
@@ -32,3 +34,7 @@ python_version = "3.13"
 strict = true
 files = ["src"]
 exclude = ["^\\.tools/"]
+
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore.*"]
+ignore_missing_imports = true
