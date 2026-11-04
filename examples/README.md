@@ -17,20 +17,18 @@ Data files are not included.
    then run chunks.sql once to seed the five October chunks.
    Skip it when resuming; rerunning inserts duplicates.
 
-## Run one chunk
+## Run and resume
 
-Git Bash, from the project root, using your existing AWS credentials:
+Follow the root README for connection variables and commands.
+Run `uv run python -m migration.runner --max-chunks 1` to stop after one newly copied
+chunk; rerun without the limit to finish. DONE chunks are rechecked without recopying.
+Do not rerun setup, load or chunk seeding scripts when resuming.
 
-```bash
-uv sync
-export AWS_DEFAULT_REGION="eu-west-1"
-export REDSHIFT_WORKGROUP="migration-dev"
-export REDSHIFT_DATABASE="migration_lab"
-export REDSHIFT_SECRET_ARN='<database credentials secret ARN>'
-uv run python -m migration.runner
-```
+The offline checks use `uv run pytest -q`. Live acceptance is a manual demo run with
+checkpoint/count inspection. A one-time rollback check on disposable fixtures passed
+on 4 November 2026; its automated AWS harness was subsequently removed to keep this
+project small.
 
-Runs chunk 1 and checks row counts after committing. Reruns recheck DONE chunks
-without copying them again.
-
-Keep the source unchanged and run one migration at a time. After a failure, check the previous query’s outcome before rerunning.
+The full demo completed on 4 November 2026: five DONE chunks with matching counts,
+100,000 source rows and 100,000 target rows. A clean stop after chunk 2 and restart
+verified that completed copies were skipped.

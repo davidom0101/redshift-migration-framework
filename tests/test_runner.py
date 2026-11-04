@@ -8,6 +8,46 @@ from migration import runner
 CONNECTION = {"WorkgroupName": "test-workgroup", "Database": "test-db", "SecretArn": "test-secret"}
 
 
+def plan_row(chunk_id, start, end, status):
+    values = ["demo", "source", "demo", "target", "event_time", start, end, status]
+    return [{"longValue": chunk_id}] + [{"stringValue": value} for value in values]
+
+
+def test_loop_rechecks_done_before_pending_and_stops_between_chunks(monkeypatch):
+    rows = [
+        plan_row(1, "2019-10-01", "2019-10-08", "PENDING"),
+        plan_row(2, "2019-10-08", "2019-10-15", "DONE"),
+        plan_row(3, "2019-10-15", "2019-10-22", "PENDING"),
+    ]
+    monkeypatch.setattr(
+        runner,
+        "query",
+        Mock(
+            side_effect=[
+                rows,
+                [[{"longValue": 0}, {"longValue": 0}]],
+            ]
+        ),
+    )
+    run = Mock()
+    monkeypatch.setattr(runner, "run_chunk", run)
+    runner.run_migration(Mock(), CONNECTION, "example", max_chunks=1)
+    assert [call.args[3] for call in run.call_args_list] == [2, 1]
+
+
+def test_overlapping_plan_stops_before_running_chunks(monkeypatch):
+    rows = [
+        plan_row(1, "2019-10-01", "2019-10-08", "DONE"),
+        plan_row(2, "2019-10-07", "2019-10-15", "PENDING"),
+    ]
+    monkeypatch.setattr(runner, "query", Mock(return_value=rows))
+    run = Mock()
+    monkeypatch.setattr(runner, "run_chunk", run)
+    with pytest.raises(RuntimeError, match="gaps or overlaps"):
+        runner.run_migration(Mock(), CONNECTION, "example")
+    run.assert_not_called()
+
+
 @pytest.fixture
 def client():
     client = Mock()

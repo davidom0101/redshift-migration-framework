@@ -1,9 +1,10 @@
-"""Copy or recheck chunk 1 of the static October example through the Data API.
+"""Copy or recheck the stored chunks of the static October example through the Data API.
 
 Run with ``uv run python -m migration.runner``. One operator must keep the source
 unchanged, prevent other target writers and resolve any earlier submission first.
 """
 
+import argparse
 import os
 import sys
 import time
@@ -16,7 +17,6 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 MIGRATION_ID = "ecommerce-events-october-demo"
-CHUNK_ID = 1
 
 
 def sql_identifier(value: str) -> str:
@@ -253,8 +253,106 @@ def run_chunk(
     return check_counts(client, connection, chunk)
 
 
+def run_migration(
+    client: Any,
+    connection: dict[str, str],
+    migration_id: str,
+    max_chunks: int | None = None,
+) -> None:
+    """Validate stored ranges, recheck DONE, then copy pending chunks in order.
+
+    max_chunks limits newly copied chunks, allowing a clean stop and restart.
+    """
+    if max_chunks is not None and max_chunks < 1:
+        raise ValueError("max_chunks must be positive.")
+    rows = query(
+        client,
+        connection,
+        f"""
+        SELECT chunk_id, source_schema, source_table, target_schema, target_table,
+               timestamp_column, chunk_start, chunk_end, status
+        FROM ops.migration_chunks
+        WHERE migration_id = {sql_literal(migration_id)}
+        ORDER BY chunk_id
+    """,
+    )
+    if not rows:
+        raise RuntimeError("No stored chunks found. Seed a new migration once before running.")
+    seen_ids = set()
+    settings = rows[0][1:6]
+    previous_end = None
+    done_ids = []
+    pending_ids = []
+    for row in rows:
+        chunk_id = int(row[0]["longValue"])
+        start = datetime.fromisoformat(row[6]["stringValue"])
+        end = datetime.fromisoformat(row[7]["stringValue"])
+        status = row[8]["stringValue"]
+        if chunk_id in seen_ids or row[1:6] != settings:
+            raise RuntimeError("Duplicate chunk IDs or inconsistent table settings.")
+        if start >= end or (previous_end is not None and start != previous_end):
+            raise RuntimeError(
+                "Chunk ranges must be ordered and contiguous, without gaps or overlaps."
+            )
+        if status not in {"DONE", "PENDING"}:
+            raise RuntimeError(f"Unsupported chunk status: {status}")
+        seen_ids.add(chunk_id)
+        previous_end = end
+        if status == "DONE":
+            done_ids.append(chunk_id)
+        else:
+            pending_ids.append(chunk_id)
+
+    source = (
+        f"{sql_identifier(settings[0]['stringValue'])}.{sql_identifier(settings[1]['stringValue'])}"
+    )
+    target = (
+        f"{sql_identifier(settings[2]['stringValue'])}.{sql_identifier(settings[3]['stringValue'])}"
+    )
+    timestamp = sql_identifier(settings[4]["stringValue"])
+    if source == target:
+        raise RuntimeError("Source and target must be different tables.")
+    start_literal = sql_literal(rows[0][6]["stringValue"])
+    end_literal = sql_literal(rows[-1][7]["stringValue"])
+    invalid = query(
+        client,
+        connection,
+        f"""
+        SELECT
+            (SELECT COUNT(*) FROM {source}
+             WHERE {timestamp} IS NULL OR {timestamp} < TIMESTAMP {start_literal}
+                   OR {timestamp} >= TIMESTAMP {end_literal}),
+            (SELECT COUNT(*) FROM {target}
+             WHERE {timestamp} IS NULL OR {timestamp} < TIMESTAMP {start_literal}
+                   OR {timestamp} >= TIMESTAMP {end_literal})
+    """,
+    )
+    if any(cell["longValue"] != 0 for cell in invalid[0]):
+        raise RuntimeError(
+            "Source or target has NULL/out-of-window timestamps; inspect before copying."
+        )
+    if not done_ids:
+        target_count = query(client, connection, f"SELECT COUNT(*) FROM {target}")
+        if target_count[0][0]["longValue"] != 0:
+            raise RuntimeError("A new migration requires an empty target.")
+
+    for chunk_id in done_ids:
+        run_chunk(client, connection, migration_id, chunk_id)
+    for copied, chunk_id in enumerate(pending_ids, 1):
+        run_chunk(client, connection, migration_id, chunk_id)
+        if max_chunks is not None and copied >= max_chunks and copied < len(pending_ids):
+            print("Stopped between checked chunks. Rerun the same command to resume.")
+            return
+    print("Migration complete: all stored chunks are DONE with matching counts.")
+
+
 def main() -> None:
     """Run the fixed example with external connection settings and AWS credentials."""
+    parser = argparse.ArgumentParser(description="Copy the stored migration chunks sequentially.")
+    parser.add_argument("--max-chunks", type=int, help="Stop after this many newly copied chunks.")
+    args = parser.parse_args()
+    if args.max_chunks is not None and args.max_chunks < 1:
+        parser.error("--max-chunks must be positive")
     connection = {
         "WorkgroupName": os.environ["REDSHIFT_WORKGROUP"],
         "Database": os.environ["REDSHIFT_DATABASE"],
@@ -270,7 +368,7 @@ def main() -> None:
         region_name=os.environ["AWS_DEFAULT_REGION"],
         config=Config(retries={"total_max_attempts": 1}, connect_timeout=10, read_timeout=30),
     )
-    run_chunk(client, connection, MIGRATION_ID, CHUNK_ID)
+    run_migration(client, connection, MIGRATION_ID, args.max_chunks)
 
 
 if __name__ == "__main__":
