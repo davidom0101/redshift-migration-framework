@@ -1,22 +1,21 @@
-"""Copy or recheck the stored chunks of the static October example through the Data API.
+"""Copy or recheck configured migration chunks through the Data API.
 
-Run with ``uv run python -m migration.runner``. One operator must keep the source
-unchanged, prevent other target writers and resolve any earlier submission first.
+Run with ``uv run python -m migration.runner --config migration.yaml``.
+One operator must keep the source unchanged, prevent other target writers and
+resolve any earlier submission first.
 """
 
 import argparse
-import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import boto3
-from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-MIGRATION_ID = "ecommerce-events-october-demo"
+from migration.config import MigrationConfig, check_stored_plan, load_config
 
 
 def sql_identifier(value: str) -> str:
@@ -29,10 +28,12 @@ def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def wait_for_statement(client: Any, statement_id: str) -> dict[str, Any]:
-    """Wait up to five minutes without cancelling or resubmitting the statement."""
+def wait_for_statement(
+    client: Any, statement_id: str, wait_timeout_seconds: int = 300
+) -> dict[str, Any]:
+    """Wait up to the configured limit without cancelling or resubmitting the statement."""
     print(f"Statement: {statement_id}", flush=True)
-    deadline = time.monotonic() + 300
+    deadline = time.monotonic() + wait_timeout_seconds
     while time.monotonic() < deadline:
         result: dict[str, Any] = client.describe_statement(Id=statement_id)
         status = result["Status"]
@@ -50,15 +51,19 @@ def wait_for_statement(client: Any, statement_id: str) -> dict[str, Any]:
     )
 
 
-def execute_sql(client: Any, connection: dict[str, str], sql: str) -> dict[str, Any]:
+def execute_sql(
+    client: Any, connection: dict[str, str], sql: str, wait_timeout_seconds: int = 300
+) -> dict[str, Any]:
     """Submit one statement and return its final description, not its result rows."""
     response = client.execute_statement(**connection, Sql=sql)
-    return wait_for_statement(client, response["Id"])
+    return wait_for_statement(client, response["Id"], wait_timeout_seconds=wait_timeout_seconds)
 
 
-def query(client: Any, connection: dict[str, str], sql: str) -> list[list[dict[str, Any]]]:
+def query(
+    client: Any, connection: dict[str, str], sql: str, wait_timeout_seconds: int = 300
+) -> list[list[dict[str, Any]]]:
     """Read a small result using the Data API's stringValue/longValue cell format."""
-    statement = execute_sql(client, connection, sql)
+    statement = execute_sql(client, connection, sql, wait_timeout_seconds=wait_timeout_seconds)
     result = client.get_statement_result(Id=statement["Id"])
     if result.get("NextToken"):
         raise RuntimeError("Unexpected large result; no copy was requested by this query.")
@@ -71,6 +76,7 @@ def read_chunk(
     connection: dict[str, str],
     migration_id: str,
     chunk_id: int,
+    wait_timeout_seconds: int = 300,
 ) -> dict[str, str]:
     """Read and validate one chunk, returning named settings ready for SQL."""
     chunk_filter = f"migration_id = {sql_literal(migration_id)} AND chunk_id = {chunk_id}"
@@ -84,6 +90,7 @@ def read_chunk(
         WHERE {chunk_filter}
         LIMIT 2
         """,
+        wait_timeout_seconds=wait_timeout_seconds,
     )
     if len(rows) != 1:
         raise RuntimeError("Expected exactly one control row; check missing or duplicate chunks.")
@@ -125,6 +132,7 @@ def read_chunk(
           AND table_name = {sql_literal(source_table)}
         ORDER BY ordinal_position
         """,
+        wait_timeout_seconds=wait_timeout_seconds,
     )
     target_columns = query(
         client,
@@ -137,6 +145,7 @@ def read_chunk(
           AND table_name = {sql_literal(target_table)}
         ORDER BY ordinal_position
         """,
+        wait_timeout_seconds=wait_timeout_seconds,
     )
     if not source_columns or source_columns != target_columns:
         raise RuntimeError("Source and target logical columns must match.")
@@ -156,13 +165,17 @@ def read_chunk(
     }
 
 
-def copy_chunk(client: Any, connection: dict[str, str], chunk: dict[str, str]) -> None:
+def copy_chunk(
+    client: Any, connection: dict[str, str], chunk: dict[str, str], wait_timeout_seconds: int = 300
+) -> None:
     """Copy an empty target range and commit its DONE checkpoint in one batch."""
     target_count_sql = f"""
         SELECT COUNT(*) FROM {chunk["target"]}
         WHERE {chunk["bounds"]}
     """
-    target_rows = query(client, connection, target_count_sql)
+    target_rows = query(
+        client, connection, target_count_sql, wait_timeout_seconds=wait_timeout_seconds
+    )
     if target_rows[0][0]["longValue"] != 0:
         raise RuntimeError("Pending chunk's target range is not empty; inspect before copying.")
 
@@ -191,7 +204,7 @@ def copy_chunk(client: Any, connection: dict[str, str], chunk: dict[str, str]) -
     except (BotoCoreError, ClientError):
         print("Copy submission failed or its outcome is unknown. Inspect before rerunning.")
         raise
-    batch = wait_for_statement(client, response["Id"])
+    batch = wait_for_statement(client, response["Id"], wait_timeout_seconds=wait_timeout_seconds)
     if batch["SubStatements"][1]["ResultRows"] != 1:
         raise RuntimeError(
             "Copy committed but checkpoint did not affect one row; inspect manually."
@@ -201,12 +214,16 @@ def copy_chunk(client: Any, connection: dict[str, str], chunk: dict[str, str]) -
         SELECT status FROM ops.migration_chunks
         WHERE {chunk["chunk_filter"]}
     """
-    checkpoint = query(client, connection, checkpoint_status_sql)
+    checkpoint = query(
+        client, connection, checkpoint_status_sql, wait_timeout_seconds=wait_timeout_seconds
+    )
     if len(checkpoint) != 1 or checkpoint[0][0]["stringValue"] != "DONE":
         raise RuntimeError("Could not confirm the committed DONE checkpoint; do not recopy.")
 
 
-def check_counts(client: Any, connection: dict[str, str], chunk: dict[str, str]) -> tuple[int, int]:
+def check_counts(
+    client: Any, connection: dict[str, str], chunk: dict[str, str], wait_timeout_seconds: int = 300
+) -> tuple[int, int]:
     """Save source/target counts and stop on mismatch, leaving the copy committed."""
     # A count failure must not undo DONE: the data copy has already committed.
     count_sql = f"""
@@ -214,7 +231,7 @@ def check_counts(client: Any, connection: dict[str, str], chunk: dict[str, str])
             (SELECT COUNT(*) FROM {chunk["source"]} WHERE {chunk["bounds"]}),
             (SELECT COUNT(*) FROM {chunk["target"]} WHERE {chunk["bounds"]})
     """
-    counts = query(client, connection, count_sql)
+    counts = query(client, connection, count_sql, wait_timeout_seconds=wait_timeout_seconds)
     source_count = int(counts[0][0]["longValue"])
     target_count = int(counts[0][1]["longValue"])
     save_counts_sql = f"""
@@ -222,7 +239,9 @@ def check_counts(client: Any, connection: dict[str, str], chunk: dict[str, str])
         SET source_count = {source_count}, target_count = {target_count}
         WHERE {chunk["chunk_filter"]} AND status = 'DONE'
     """
-    saved = execute_sql(client, connection, save_counts_sql)
+    saved = execute_sql(
+        client, connection, save_counts_sql, wait_timeout_seconds=wait_timeout_seconds
+    )
     if saved["ResultRows"] != 1:
         raise RuntimeError("Counts were not saved to exactly one DONE chunk; inspect manually.")
     print(f"Counts: source={source_count}, target={target_count}")
@@ -236,21 +255,24 @@ def run_chunk(
     connection: dict[str, str],
     migration_id: str,
     chunk_id: int,
+    wait_timeout_seconds: int = 300,
 ) -> tuple[int, int]:
     """Copy one pending chunk or recheck a completed chunk without copying again.
 
     Requires a static source, no other target writers and no unresolved previous
     batch. A failure stops execution; an operator must establish its outcome.
     """
-    chunk = read_chunk(client, connection, migration_id, chunk_id)
+    chunk = read_chunk(
+        client, connection, migration_id, chunk_id, wait_timeout_seconds=wait_timeout_seconds
+    )
     print(f"Chunk {chunk_id}: {chunk['status']}")
 
     if chunk["status"] == "PENDING":
-        copy_chunk(client, connection, chunk)
+        copy_chunk(client, connection, chunk, wait_timeout_seconds=wait_timeout_seconds)
     else:
         print("Copy already committed; checking counts without another INSERT.")
 
-    return check_counts(client, connection, chunk)
+    return check_counts(client, connection, chunk, wait_timeout_seconds=wait_timeout_seconds)
 
 
 def run_migration(
@@ -258,6 +280,8 @@ def run_migration(
     connection: dict[str, str],
     migration_id: str,
     max_chunks: int | None = None,
+    wait_timeout_seconds: int = 300,
+    config: MigrationConfig | None = None,
 ) -> None:
     """Validate stored ranges, recheck DONE, then copy pending chunks in order.
 
@@ -275,7 +299,10 @@ def run_migration(
         WHERE migration_id = {sql_literal(migration_id)}
         ORDER BY chunk_id
     """,
+        wait_timeout_seconds=wait_timeout_seconds,
     )
+    if config is not None:
+        check_stored_plan(config, rows)
     if not rows:
         raise RuntimeError("No stored chunks found. Seed a new migration once before running.")
     seen_ids = set()
@@ -326,20 +353,30 @@ def run_migration(
              WHERE {timestamp} IS NULL OR {timestamp} < TIMESTAMP {start_literal}
                    OR {timestamp} >= TIMESTAMP {end_literal})
     """,
+        wait_timeout_seconds=wait_timeout_seconds,
     )
     if any(cell["longValue"] != 0 for cell in invalid[0]):
         raise RuntimeError(
             "Source or target has NULL/out-of-window timestamps; inspect before copying."
         )
     if not done_ids:
-        target_count = query(client, connection, f"SELECT COUNT(*) FROM {target}")
+        target_count = query(
+            client,
+            connection,
+            f"SELECT COUNT(*) FROM {target}",
+            wait_timeout_seconds=wait_timeout_seconds,
+        )
         if target_count[0][0]["longValue"] != 0:
             raise RuntimeError("A new migration requires an empty target.")
 
     for chunk_id in done_ids:
-        run_chunk(client, connection, migration_id, chunk_id)
+        run_chunk(
+            client, connection, migration_id, chunk_id, wait_timeout_seconds=wait_timeout_seconds
+        )
     for copied, chunk_id in enumerate(pending_ids, 1):
-        run_chunk(client, connection, migration_id, chunk_id)
+        run_chunk(
+            client, connection, migration_id, chunk_id, wait_timeout_seconds=wait_timeout_seconds
+        )
         if max_chunks is not None and copied >= max_chunks and copied < len(pending_ids):
             print("Stopped between checked chunks. Rerun the same command to resume.")
             return
@@ -347,34 +384,41 @@ def run_migration(
 
 
 def main() -> None:
-    """Run the fixed example with external connection settings and AWS credentials."""
+    """Run the YAML migration with credentials from the AWS chain."""
     parser = argparse.ArgumentParser(description="Copy the stored migration chunks sequentially.")
     parser.add_argument("--max-chunks", type=int, help="Stop after this many newly copied chunks.")
+    parser.add_argument("--config", type=Path, required=True, help="Migration YAML file.")
     args = parser.parse_args()
     if args.max_chunks is not None and args.max_chunks < 1:
         parser.error("--max-chunks must be positive")
-    connection = {
-        "WorkgroupName": os.environ["REDSHIFT_WORKGROUP"],
-        "Database": os.environ["REDSHIFT_DATABASE"],
-        "SecretArn": os.environ["REDSHIFT_SECRET_ARN"],
-    }
+    config = load_config(args.config)
     confirmation = input(
         "Confirm static source, no other writers/runner and no unresolved copy. Type yes: "
     )
     if confirmation != "yes":
         raise SystemExit("No SQL submitted.")
-    client = boto3.client(
-        "redshift-data",
-        region_name=os.environ["AWS_DEFAULT_REGION"],
-        config=Config(retries={"total_max_attempts": 1}, connect_timeout=10, read_timeout=30),
+    client = config.create_client()
+    run_migration(
+        client,
+        config.connection,
+        config.migration_id,
+        args.max_chunks,
+        wait_timeout_seconds=config.wait_timeout_seconds,
+        config=config,
     )
-    run_migration(client, connection, MIGRATION_ID, args.max_chunks)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (BotoCoreError, ClientError, RuntimeError, KeyboardInterrupt) as error:
+    except (
+        BotoCoreError,
+        ClientError,
+        RuntimeError,
+        ValueError,
+        OSError,
+        KeyboardInterrupt,
+    ) as error:
         print(
             f"Stopped: {error}\nInspect any submitted statements before rerunning.", file=sys.stderr
         )

@@ -5,6 +5,7 @@ description = "Chunked Redshift deep-copy migration using the Data API."
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "boto3>=1.40,<2",
+    "pyyaml>=6,<7",
 ]
 
 [dependency-groups]
@@ -36,5 +37,5 @@ files = ["src"]
 exclude = ["^\\.tools/"]
 
 [[tool.mypy.overrides]]
-module = ["boto3", "botocore.*"]
+module = ["boto3", "botocore.*", "yaml"]
 ignore_missing_imports = true

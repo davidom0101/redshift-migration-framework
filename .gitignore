@@ -25,5 +25,4 @@ dist/
 SETUP_STATUS.md
 results/private/
 
-# Local project notes, I'll add this at the end
-/README.md
+/migration.yaml

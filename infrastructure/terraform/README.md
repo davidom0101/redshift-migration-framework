@@ -26,7 +26,7 @@ out of Git; retain the provider lockfile.
 
 Use Query Editor v2 or the Data API for `migration-dev` / `migration_lab`.
 Grant IAM query and managed-secret access separately; the secret provides admin
-database access. Follow the [example setup](../../examples/README.md) for a new
+database access. Follow the example setup in /README.md for a new
 database. Do not replay setup against populated tables.
 
 ## Costs and cleanup
