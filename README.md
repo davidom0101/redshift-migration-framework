@@ -1,61 +1,90 @@
 # Redshift chunked deep copy
 
-Rebuild a Redshift table with different sort or distribution keys. One Python runner
-copies date chunks sequentially through the Data API and records progress in
-`ops.migration_chunks` so completed chunks can be skipped on restart.
+Deep-copy an unsorted Redshift table into an empty replacement with your chosen
+sort and distribution keys. The framework copies timestamp chunks and checkpoints
+progress so an interrupted migration can resume without repeating completed work.
 
-## Run
+## Why I built this
 
-Requires Python 3.13, uv, AWS credentials and Data API access. For optional infrastructure
-setup, see /infrastructure/terraform/README.md.
+At work, I needed to rebuild fact tables that were 100% unsorted, some exceeding
+10 TB, with distribution and sort keys that no longer suited common joins and
+filters. Deep copy sorted the data while rebuilding with new keys, and was a
+better fit than `VACUUM` for such a large unsorted region.
+See [AWS: Performing a deep copy](https://docs.aws.amazon.com/redshift/latest/dg/performing-a-deep-copy.html).
 
-Create an empty target with matching logical columns and your chosen keys. From the
-project root, copy the template and edit the connection, tables and chunk ranges:
+Chunking made interruptions manageable, completed work could be kept and the
+remaining chunks resumed. YAML made the process reusable across tables.
+This repository is an anonymised reconstruction with a runnable demo.
 
-```bash
-uv sync --locked
-cp examples/migration.yaml migration.yaml
-# Edit migration.yaml before continuing.
-uv run python -m migration.setup --config migration.yaml
-uv run python -m migration.runner --config migration.yaml
-```
+## Migrate a table
 
-Use `workgroup` for Serverless or `cluster_identifier` for provisioned Redshift.
-Supply a database secret ARN in YAML; AWS credentials come from the usual credential chain.
+Requires Python 3.13, uv, AWS credentials and Data API access.
+Optional infrastructure: /infrastructure/terraform/README.md.
 
-Setup creates missing control objects and seeds the chunks once. An identical rerun
-preserves progress. Setup refuses an incompatible control table, and both commands
-refuse a YAML plan that differs from the stored chunks.
+1. **Create an empty target** matching the source's columns with your chosen sort/dist keys.
+2. **Configure the YAML.** From the project root:
+
+   ```bash
+   uv sync --locked
+   cp examples/migration.yaml migration.yaml
+   ```
+
+   Set the connection, migration ID, tables, timestamp column and chunk ranges.
+3. **Run setup** to create the control table.
+
+   ```bash
+   uv run python -m migration.setup --config migration.yaml
+   ```
+
+4. **Pause source writes**.
+5. **Run the migration:**
+
+   ```bash
+   uv run python -m migration.runner --config migration.yaml
+   ```
+
+6. **Confirm all chunks are DONE with matching counts**, then do any reconciliation and 
+handle grants and cutover.
 
 ## Stop and resume
 
-Add `--max-chunks 1` to stop after one newly copied and checked chunk. Resume with the
-original run command and YAML. The runner rechecks DONE chunks before copying pending
-ones. Copy and DONE commit together; a later count failure leaves the chunk DONE.
+Add `--max-chunks 1` to stop after one newly copied and checked chunk.
 
-## Operating limits
+## Chunk Copying Process
 
-- Use one operator and runner. Pause source writes and prevent other target writers.
-- Date chunks suit a compound sort key with the date column first, such as
-  `COMPOUND SORTKEY (event_time)`. Use contiguous UTC ranges covering all rows,
-  with inclusive starts and exclusive ends. NULL dates are refused.
-- `wait_timeout_seconds` defaults to 3,600 per statement. A timeout stops polling;
-  the SQL may still be running. Inspect its outcome before retrying. There are no automatic retries.
-- Matching counts do not prove identical contents. Grants and cutover are manual.
+```mermaid
+flowchart TD
+    A["Read and validate the plan"] --> B["Recheck completed chunks<br/>DONE chunks are not copied again"]
+    B --> C{"Pending chunks remain?"}
+
+    C -- No --> G["Migration complete"]
+    C -- Yes --> D
+
+    subgraph T["One transaction â€” both commit together"]
+        D["Copy the next chunk"] --> E["Mark the chunk DONE"]
+    end
+
+    E --> F["Compare and save row counts"]
+    F -- Counts match --> C
+    F -- Counts differ --> H["Stop for inspection<br/>Chunk remains DONE"]
+
+    style T fill:#e8f0fe,stroke:#4285f4
+    style G fill:#e6f4ea,stroke:#34a853
+    style H fill:#fff3e0,stroke:#ef6c00
+```
 
 ## Prepare the demo
 
-The demo uses 100,000 October 2019 events sampled from Michael Kechinov's eCommerce
-behavior dataset on Kaggle. Data files are not included. For a new demo only:
+The prepared sample contains 100,000 October 2019 events from the REES46 eCommerce
+dataset published by Michael Kechinov on Kaggle, with `event_id` added. For a new demo:
 
 1. Run /examples/schema.sql.
-2. Prepare a gzip CSV with a header, unique BIGINT event_id values, and UTC timestamps.
-   Use the ten-column order in /examples/load.sql; the original has nine columns.
-3. Upload it under redshift-migration/source/ in your private S3 bucket. Set the bucket
-   name in /examples/load.sql and run it once against empty source and dimension tables.
-   Leave the target empty, then follow the run steps above.
+2. Download [events.csv.gz](https://github.com/davidom0101/redshift-migration-framework/releases/download/v0.1.0/events.csv.gz)
+   and upload it as `redshift-migration/source/events.csv.gz` in your private S3 bucket.
+3. Set the bucket name in /examples/load.sql and run it once against empty source and
+   dimension tables. Leave the target empty, then follow the migration steps above.
 
-## Verification
+## Development checks
 
 ```bash
 uv run pytest -q
@@ -63,7 +92,3 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy
 ```
-
-On 4 November 2026, the Redshift demo finished all five chunks with matching counts
-and 100,000 rows in each table. Live checks verified rollback, stop/resume without
-recopying, and that rerunning YAML setup preserved progress. This was not a throughput benchmark.
